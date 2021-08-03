@@ -1,7 +1,11 @@
 # ponomarenko_multi_image
 Extension of Ponomarenko Noise Estimation method for a sequence of images.
 
+<<<<<<< HEAD
 ## Usage
+=======
+## Usage:
+>>>>>>> 618404f5931ce61ee51e048f66a8fd33c8909fcc
 
 Compile:
 
