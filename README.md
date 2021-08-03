@@ -17,7 +17,7 @@ Run the noise estimation program for a directory containing `.png` image files:
 ```
 
 ## Test
-Run the extended version on multiple images
+Run the extended version on multiple images:
 ```
 ./ponomarenko_multi ../test_images/seq0/
 ```
