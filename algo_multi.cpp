@@ -43,14 +43,27 @@
 #include "framework/operations.cpp"
 #include "framework/CHistogram.cpp"
 
+
+using namespace std;
+
 //! A data structure to store the global id of a block within a sequence
 // of images
 struct BlockId
 {
   int image;
-  int block;
+  int block_origin;
   int bin;
 };
+
+template <typename T>
+void print_arr(const T* data, int len)
+{
+  for (size_t i = 0; i < len; ++i) {
+    cout << data[i] << ", ";
+  }
+  cout << endl;
+}
+
 
 //! Computes the delta matrix and returns the normalization factor theta
 /*!
@@ -194,6 +207,32 @@ int get_T(int w)
   }
 }
 
+
+
+//! Build an index map from valid blocks to raw blocks of an image,
+//! so that the origin of the i-th block in a valid block list corresponds to the valid_coords[i]-th 
+//! pixel in the raw image
+/*!
+  \param *mask Input valid mask of an image, 0 for valid, 1 for invalid
+  \param **valid_coords pointer to output index map
+  \param Nx Length of a row in the image
+  \param Ny Length of a column in the image
+  \param w Block side
+  \param num_blocks Number of valid blocks
+*/
+void make_valid_coords(const int* mask, unsigned* valid_coords,
+                       int Nx, int Ny) {
+  int count_coords = 0;
+  //    
+  for (int i = 0; i < Nx*Ny; i++) {
+    if (mask[i] == 0) {
+      valid_coords[count_coords++] = i;
+
+    }
+  }
+}
+
+
 //! Reads all valid blocks (all neighbor pixels are different when the mask
 //! is active) in the image
 /*!
@@ -209,53 +248,42 @@ int get_T(int w)
 void read_all_valid_blocks(float *D,
                            float *u,
                            int Nx, int Ny,
-                           int w, unsigned num_blocks, int *mask)
-{
-  if (mask == NULL)
-  {
-#ifdef _OPENMP
-#pragma omp parallel for
-#endif
-    for (unsigned q = 0; q < num_blocks; q++)
-    {
-      for (int j = 0; j < w; j++)
-      {
-        for (int i = 0; i < w; i++)
-        {
-          D[q * w * w + j * w + i] = u[j * Nx + i + q];
+                           int w, unsigned num_blocks, int *mask) {  
+  if (mask == NULL) {
+    const int w2 = w * w;
+    int q = 0;
+    for (int y = 0; y < Ny - w + 1; ++y) {
+      for (int x = 0; x < Nx - w + 1; ++x) {
+        for (int j = 0; j < w; ++j) {
+          for (int i = 0; i < w; ++i) {
+            D[q*w2+j*w+i] = u[(j+y)*Nx+i+x];
+          }
         }
+        ++q;
       }
     }
   }
-  else
-  {
-    unsigned *valid_coords = new unsigned[num_blocks];
-    int count_coords = 0;
-    //
-    for (int i = 0; i < Nx * Ny; i++)
-    {
-      if (mask[i] == 0)
-        valid_coords[count_coords++] = i;
-    }
+  
+  else {
+    unsigned* valid_coords = new unsigned[num_blocks];
+    make_valid_coords(mask, valid_coords, Nx, Ny);
 
-#ifdef _OPENMP
-#pragma omp parallel for
-#endif
-    for (unsigned q = 0; q < num_blocks; q++)
-    {
-      int addr = valid_coords[q];
+    #ifdef _OPENMP
+    #pragma omp parallel for
+    #endif
+    for (unsigned q = 0; q < num_blocks; q++) {
+      int addr = valid_coords[q];      
 
-      for (int j = 0; j < w; j++)
-      {
-        for (int i = 0; i < w; i++)
-        {
-          D[q * w * w + j * w + i] = u[j * Nx + i + addr];
+      for (int j = 0; j < w; j++) {
+        for (int i = 0; i < w; i++) {
+            D[q*w*w+j*w+i] = u[j*Nx+i+addr];
         }
       }
     }
     delete[] valid_coords;
   }
 }
+
 
 //! Computes the mean of all given blocks
 /*!
@@ -391,7 +419,7 @@ void normalize_FFTW(float *blocks, int w, int num_blocks)
 }
 
 /**
- * @brief Build a mask for valide pixel. If mask(i, j) = true, the pixels will not be used.
+ * @brief Build a mask for invalid pixel. If mask(i, j) = true, the pixels will not be used.
  *
  * @param i_im : noisy image;
  * @param o_mask : will contain the mask for all pixel in the image size;
@@ -450,6 +478,120 @@ unsigned buildMask(CImage &i_im, int *o_mask,
   return count;
 }
 
+
+/**
+ * @brief Build a mask for saturated (invalid) pixel. If mask(i, j) = true, the pixels will not be used.
+ *
+ * @param i_im : noisy image;
+ * @param o_mask : will contain the mask for all pixel in the image size;
+ *
+ * @return number of valid blocks.
+ *
+ **/
+unsigned buildSaturatedMask(CImage &i_im, int *o_mask,
+                    unsigned Nx, unsigned Ny, unsigned w,
+                    unsigned num_channels) {
+  unsigned count  = 0;
+  
+  //! Get the maximum value of the channel
+  // float max_val = 0;
+  std::vector<float> max_vals(num_channels);
+
+  
+  for (unsigned c = 0; c < num_channels; c++) {
+    for (unsigned ij = 0; ij < Nx*Ny; ij++) {
+      float *u = i_im.get_channel(c);
+      max_vals[c] = max_vals[c] < u[ij] ? u[ij] : max_vals[c];
+    }
+  }
+
+  memset(o_mask, 0, Nx*Ny*sizeof(*o_mask));
+
+  for (unsigned j = 0; j < Ny; ++j) {
+    for (unsigned i = 0; i < Nx; ++i) {
+      const unsigned ij = j * Nx + i;
+
+      for (unsigned c = 0; c < num_channels; c++) {
+        float *u = i_im.get_channel(c);
+        int invalid_pixel = (c == 0 ? 0 : o_mask[ij]);
+        //! Look if the pixel is saturated
+        o_mask[ij] = u[ij] >= max_vals[c] ? 1 : invalid_pixel;
+      }
+    }
+  }
+
+  for (unsigned j = 0; j < Ny; ++j) {
+    for (unsigned i = 0; i < Nx; ++i) {
+      const unsigned ij = j * Nx + i;
+
+      if (i < Nx - w + 1 && j < Ny - w + 1) {
+        unsigned accum = 0;
+        for (size_t ii = 0; ii < w; ++ii) {
+          for (size_t jj = 0; jj < w; ++jj) {
+            accum += o_mask[ij + ii*Nx + jj];
+          }
+        }
+        
+        if (accum > 0) {
+          o_mask[ij] = 1;
+        } else {
+          ++count;
+        }
+      } else {
+        o_mask[ij] = 1;
+      }
+    }
+  }
+
+
+  // for (unsigned ij = 0; ij < Nx*Ny; ij++) {
+  //   const unsigned j = ij / Nx;
+  //   const unsigned i = ij - j * Nx;
+    
+  //   if (i < Nx - w + 1 && j < Ny - w + 1) {
+  //     unsigned accum = 0;
+  //     for (int ii = 0; ii < w; ++ii) {
+  //       for (int jj = 0; jj < w; ++jj) {
+  //         accum += o_mask[ij + ii*Nx + jj];
+  //       }
+  //     }
+      
+  //     if (accum > 0) {
+  //       o_mask[ij] = 1;
+  //     } else {
+  //       ++count;
+  //     }
+  //   } else {
+  //     o_mask[ij] = 1;
+  //   }
+  // }
+
+  return count;
+}
+
+/**
+ * @brief Build a mask of all pixels excluding right and bottom borders. If mask(i, j) = true, the pixels will not be used.
+ *
+ * @param o_mask : will contain the mask for all pixel in the image size;
+ *
+ * @return number of valid blocks.
+ *
+ **/
+unsigned buildFullMask(int *o_mask,
+                            unsigned Nx, unsigned Ny, unsigned w)
+{
+
+  for (size_t ij = 0; ij < Nx*Ny; ++ij) {
+    const size_t j = ij / Nx;
+    const size_t i = ij - j * Nx;
+    o_mask[ij] = (i < Nx - w + 1 && j < Ny - w + 1) ? 0 : 1;
+  }
+
+
+
+  return (Nx - w + 1) * (Ny - w + 1);
+}
+
 /**
  * @brief Get the names of all .png or .bmp files in the given directory
  *
@@ -468,7 +610,7 @@ std::vector<std::string> get_filenames(const std::string &path)
   {
     return files;
   }
-  int count = 0;
+
   while ((entry = readdir(dir)) != NULL)
   {
     std::string fname(entry->d_name);
@@ -493,13 +635,12 @@ std::vector<std::string> get_filenames(const std::string &path)
   \param block_ids_selected List of pointers to the blocks
   \param inputs List of pointers to the blocks
   \param w Block side
-  \param num_bins Number of bins
   \param T Number of low-freq coefficients, excluding DC
   \param ch Channel of the computed variances
   \return Length of the returned variances list
 */
 int compute_VH(double *VH, const std::vector<BlockId> &block_ids_selected,
-               const std::vector<std::string> &inputs, int w, int num_bins, int T, int ch)
+               const std::vector<std::string> &inputs, int w, int T, int ch)
 {
   std::vector<std::vector<BlockId>> block_ids_by_image(inputs.size());
   for (const BlockId block_id : block_ids_selected)
@@ -543,7 +684,7 @@ int compute_VH(double *VH, const std::vector<BlockId> &block_ids_selected,
     const uint32_t w2 = w * w;
     float *image = input.get_channel(ch);
 
-    // read blocks from the image
+
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
@@ -553,8 +694,8 @@ int compute_VH(double *VH, const std::vector<BlockId> &block_ids_selected,
       {
         for (int i = 0; i < w; ++i)
         {
-          int block_in_image = block_ids[q].block;
-          blocks[q * w2 + j * w + i] = image[block_in_image + j * Nx + i];
+          int block_origin = block_ids[q].block_origin;
+          blocks[q * w2 + j * w + i] = image[block_origin + j * Nx + i];
         }
       }
     }
@@ -606,8 +747,8 @@ void algorithm(int argc, char **argv)
   options.push_back(&owin);
   OptStruct opercentile = {"p:", 1, "0.005", NULL, "Percentile"};
   options.push_back(&opercentile);
-  OptStruct ore = {"r", 0, NULL, NULL, "Flag to remove equal pixels"};
-  options.push_back(&ore);
+  // OptStruct ore = {"r", 0, NULL, NULL, "Flag to remove equal pixels"};
+  // options.push_back(&ore);
   OptStruct obins = {"b:", 0, "0", NULL, "Number of bins"};
   options.push_back(&obins);
   OptStruct oD = {"D:", 7, "7", NULL, "Filtering distance"};
@@ -616,6 +757,8 @@ void algorithm(int argc, char **argv)
   options.push_back(&ofiltercurve);
   OptStruct omeanMethod = {"m:", 2, "2", NULL, "Mean computation method"};
   options.push_back(&omeanMethod);
+  OptStruct oremoveSaturate = {"s", 0, NULL, NULL, "Flag to remove saturated pixels"};
+  options.push_back(&oremoveSaturate);  
   OptStruct ochannel = {"c:", 3, "3", NULL, "Number of channels"};
   options.push_back(&ochannel);
 
@@ -640,7 +783,8 @@ void algorithm(int argc, char **argv)
   int D = atoi(oD.value);
   int curve_filter_iterations = atoi(ofiltercurve.value);
   int mean_method = atoi(omeanMethod.value);
-  bool remove_equal_pixels_blocks = ore.flag;
+  // bool remove_equal_pixels_blocks = ore.flag;
+  bool remove_saturated_pixels_blocks = oremoveSaturate.flag;
   int num_channels = atoi(ochannel.value);
 
 // Parallelization config
@@ -651,7 +795,7 @@ void algorithm(int argc, char **argv)
   CFramework::set_verbose(false);
 
   // Custom percentile or given by the user?
-  bool custom_percentile = is_custom_percentile(opercentile.value);
+  // bool custom_percentile = is_custom_percentile(opercentile.value);
 
   // Load input image
   std::string path(pinput.value);
@@ -694,28 +838,34 @@ void algorithm(int argc, char **argv)
     int total_blocks = (Nx - w + 1) * (Ny - w + 1); // Number of overlapping blocks
 
     // Create equal pixels mask
-    int *mask_all;
+    int *mask_all = NULL;
     int num_blocks;
 
-    if (remove_equal_pixels_blocks)
-    {
-      mask_all = new int[Nx * Ny];
-      num_blocks = buildMask(input, mask_all, Nx, Ny, w, num_channels);
-    }
+
+    // int *mask_saturated;
+    mask_all = new int[Nx * Ny];
+    if (remove_saturated_pixels_blocks) {
+      num_blocks = buildSaturatedMask(input, mask_all, Nx, Ny, w, num_channels);
+    } 
+    // else if (remove_equal_pixels_blocks)
+    // {
+    //   mask_all = new int[Nx * Ny];
+    //   num_blocks = buildMask(input, mask_all, Nx, Ny, w, num_channels);
+    // }
     else
     {
-      mask_all = NULL;
-      num_blocks = total_blocks;
+      num_blocks = buildFullMask(mask_all, Nx, Ny, w);
     }
+
 
     if (input_idx == 0)
     {
       // reserve space for global storage
       for (int ch = 0; ch < num_channels; ++ch)
       {
-        means_all[ch].reserve(inputs.size() * num_blocks);
-        VL_all[ch].reserve(inputs.size() * num_blocks);
-        block_ids_all[ch].reserve(inputs.size() * num_blocks);
+        means_all[ch].reserve(inputs.size() * total_blocks);
+        VL_all[ch].reserve(inputs.size() * total_blocks);
+        block_ids_all[ch].reserve(inputs.size() * total_blocks);
       }
 
       // Set number of bins
@@ -756,12 +906,16 @@ void algorithm(int argc, char **argv)
     fftwf_plan fft_plan = fftwf_plan_many_r2r(2, nbTable, num_blocks, blocks,
                                               nembed, 1, w * w, blocks, nembed,
                                               1, w * w, kindTable, FFTW_ESTIMATE);
+    
+    unsigned* valid_coords = new unsigned[num_blocks];
+    make_valid_coords(mask_all, valid_coords, Nx, Ny);
 
     // Process each channel
     for (int ch = 0; ch < num_channels; ch++)
     {
       float *u = input.get_channel(ch);
-
+      
+      
       read_all_valid_blocks(blocks, u, Nx, Ny, w, num_blocks, mask_all);
 
       // Compute means
@@ -784,9 +938,11 @@ void algorithm(int argc, char **argv)
       for (int i = 0; i < num_blocks; ++i)
       {
         block_ids[i].image = input_idx;
-        block_ids[i].block = i;
+        // block_ids[i].block_origin = i;
+        block_ids[i].block_origin = valid_coords[i];
         block_ids[i].bin = -1;
       }
+        // cout << "valid_coords[" << i << "]" << endl;
 
       // Compute VL
       std::vector<float> VL(num_blocks);
@@ -827,6 +983,7 @@ void algorithm(int argc, char **argv)
       delete[] mask_all;
 
     delete[] blocks;
+    delete[] valid_coords;
   } // end for each input
 
   for (int ch = 0; ch < num_channels; ++ch)
@@ -846,6 +1003,8 @@ void algorithm(int argc, char **argv)
                                                    means_all[ch].data(),
                                                    means_all[ch].size());
 
+    // print_arr(means_all[ch].data(), means_all[ch].size());
+
     // store the blocks used for VH computation
     // The relationship is: image <-> block <-> bin
     std::vector<BlockId> block_ids_selected;
@@ -853,7 +1012,7 @@ void algorithm(int argc, char **argv)
     // for (int i = 0; i < block_ids_all[ch].size(); ++i) {
     //   auto e = block_ids_all[ch][i];
     //   if (e.image == 1) continue;
-    //   printf("image, block, bin = %d, %d, %d\n", e.image, e.block, e.bin);
+    //   printf("image, block, bin = %d, %d, %d\n", e.image, e.block_origin, e.bin);
 
     //   printf("mean, VL = %f, %f\n", means_all[ch][i], VL_all[ch][i]);
 
@@ -902,7 +1061,7 @@ void algorithm(int argc, char **argv)
     }
 
     std::vector<double> VH(num_bins * w * w, 0);
-    int VH_count = compute_VH(VH.data(), block_ids_selected, inputs, w, num_bins, T, ch);
+    int VH_count = compute_VH(VH.data(), block_ids_selected, inputs, w, T, ch);
 
     PRINT_VERBOSE("VH_count: %d\n", VH_count);
 
@@ -924,10 +1083,10 @@ void algorithm(int argc, char **argv)
 
       float tilde_sigma = sqrt(median(&VH[bin * w * w], VH_count));
       vstds[ch * num_bins + bin] = tilde_sigma;
+
       PRINT_VERBOSE("K: %d\n", int(histo_block_id.get_num_elements_bin(bin) * p));
     }
 
-    // delete[] VH;
   }
 
   PRINT_VERBOSE("vstds:\n");
